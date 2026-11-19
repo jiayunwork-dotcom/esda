@@ -13,7 +13,12 @@ from libpysal.weights.spatial_lag import lag_spatial
 from libpysal.weights.util import fill_diagonal
 from scipy import stats
 
-from .crand import _prepare_univariate
+from .crand import (
+    _prepare_univariate,
+    crand_components,
+    mask_unobserved,
+    rebuild_sparse_weights,
+)
 from .crand import crand as _crand_plus
 from .crand import njit as _njit
 
@@ -220,6 +225,30 @@ class G_Local:
     alternative : None or str, optional
         The alternative hypothesis for conditional randomization. See
         ``crand.crand()`` for complete description.
+    by_component : bool
+        (default=False) If True, the analysis is decomposed over the
+        weakly connected components of the graph induced by the observed
+        (non-NaN) sites. Sites with a missing value are dropped from the
+        graph together with all of their edges before the components are
+        computed, so a missing observation can split a network into
+        separate pieces. Each component normalises its statistic on its
+        own observations, the Gi/Gi* (``star``) handling is resolved on
+        the retained weights, and conditional randomization only draws
+        from the remaining sites of the same component. Results are
+        reported at the original site positions; sites without a valid
+        statistic (missing observations, components with fewer than
+        three observed sites, constant components, and cells whose
+        denominator is zero) are returned as NaN. The input ``y`` and
+        ``w`` are never modified, and ``self.w`` then holds the
+        transformed weights of the observed subgraph. The default
+        (False) keeps the whole-graph analysis.
+    component_labels_ : array
+        (only set when ``by_component=True``) (n,) component id of every
+        site in the observed graph; -1 marks sites dropped because their
+        value is NaN. In this mode ``y_sum`` holds, for every site, the
+        sum of its component's observed values (NaN for dropped sites),
+        and ``sim`` keeps one column per original site, with all-NaN
+        columns where no statistic was computed.
 
     Attributes
     ----------
@@ -355,8 +384,23 @@ class G_Local:
         seed=None,
         island_weight=0,
         alternative=None,
+        by_component=False,
     ):
         y = np.asarray(y).flatten()
+        if by_component:
+            self._init_by_component(
+                y,
+                w,
+                transform,
+                permutations,
+                star,
+                keep_simulations,
+                n_jobs,
+                seed,
+                island_weight,
+                alternative,
+            )
+            return
         self.n = len(y)
         self.y = y
         w, star = _infer_star_and_structure_w(w, star, transform)
@@ -391,6 +435,170 @@ class G_Local:
                 self.VG_sim = self.seG_sim * self.seG_sim
                 self.z_sim = (self.Gs - self.EG_sim) / self.seG_sim
                 self.p_z_sim = stats.norm.sf(np.abs(self.z_sim))
+
+    def _init_by_component(
+        self,
+        y,
+        w,
+        transform,
+        permutations,
+        star,
+        keep_simulations,
+        n_jobs,
+        seed,
+        island_weight,
+        alternative,
+    ):
+        """Component-wise local G inference (see ``by_component``)."""
+        n = len(y)
+        if w.n != n:
+            raise ValueError(
+                f"Length of y ({n}) does not match the number of "
+                f"observations in w ({w.n})."
+            )
+        if np.isinf(y).any():
+            raise ValueError(
+                "y contains infinite values; only finite values or NaN are supported."
+            )
+        self.n = n
+        self.y = y
+        self.permutations = permutations
+        self.w_transform = transform
+
+        # outputs at original positions; missing unless computed
+        self.Gs = np.full(n, np.nan)
+        self.EGs = np.full(n, np.nan)
+        self.VGs = np.full(n, np.nan)
+        self.Zs = np.full(n, np.nan)
+        # component id per original site; -1 marks unobserved sites
+        self.component_labels_ = np.full(n, -1, dtype=int)
+        # per-site sum of the component's observed values
+        self.y_sum = np.full(n, np.nan)
+
+        valid, adj_observed, _, comp_ptr, perm = mask_unobserved(y, w.sparse)
+        n_valid = perm.shape[0]
+        n_comp = comp_ptr.shape[0] - 1
+        valid_pos = np.flatnonzero(valid)
+        valid_pos_packed = valid_pos[perm]
+        active = np.zeros(0, dtype=bool)
+
+        if n_valid:
+            # the Gi/Gi* (star) handling and the transform act on the
+            # retained edges only; the caller's weights object is never
+            # modified
+            w_observed = rebuild_sparse_weights(w, adj_observed)
+            w_observed, star = _infer_star_and_structure_w(w_observed, star, transform)
+            self.w = w_observed
+            self.star = star
+            adjacency = w_observed.sparse[perm][:, perm].tocsr()
+            adjacency.eliminate_zeros()
+
+            y_packed = y[valid][perm]
+            sizes = np.diff(comp_ptr)
+            labels_packed = np.repeat(np.arange(n_comp), sizes)
+
+            # normalise on each component's own observations
+            comp_sum = np.bincount(labels_packed, weights=y_packed, minlength=n_comp)
+            comp_min = np.minimum.reduceat(y_packed, comp_ptr[:-1])
+            comp_max = np.maximum.reduceat(y_packed, comp_ptr[:-1])
+            active_comp = (sizes >= 3) & (comp_min != comp_max)
+
+            remove_self = not star
+            n_c = sizes[labels_packed]
+            N_c = n_c - remove_self
+            y_sum = comp_sum[labels_packed]
+            den = y_sum - y_packed * remove_self
+            Gs_packed = np.full(n_valid, np.nan)
+            active = active_comp[labels_packed]
+            with np.errstate(all="ignore"):
+                Gs_packed[active] = (adjacency @ y_packed)[active] / den[active]
+            # cells with a zero denominator have no statistic and no
+            # permutation, but their value stays in the sampling pool
+            active &= np.isfinite(Gs_packed)
+
+            # analytical moments, with each component's own N and sums
+            with np.errstate(all="ignore"):
+                ssq = np.bincount(labels_packed, weights=y_packed**2, minlength=n_comp)
+                empirical_mean = (y_sum - y_packed * remove_self) / N_c
+                mean_of_squares = (ssq[labels_packed] - y_packed**2 * remove_self) / N_c
+                empirical_variance = mean_of_squares - empirical_mean**2
+                cardinality = np.asarray(adjacency.sum(axis=1)).flatten()
+                expected_value = cardinality / N_c
+                expected_variance = cardinality * (N_c - cardinality)
+                expected_variance /= N_c - 1
+                expected_variance *= 1 / N_c**2
+                expected_variance *= empirical_variance / (empirical_mean**2)
+                Zs_packed = (Gs_packed - expected_value) / np.sqrt(expected_variance)
+            # degenerate components report missing moments as well
+            expected_value[~active_comp[labels_packed]] = np.nan
+            expected_variance[~active_comp[labels_packed]] = np.nan
+            Zs_packed[~active_comp[labels_packed]] = np.nan
+
+            self.y_sum[valid_pos_packed] = y_sum
+            self.Gs[valid_pos_packed] = Gs_packed
+            self.EGs[valid_pos_packed] = expected_value
+            self.VGs[valid_pos_packed] = expected_variance
+            self.Zs[valid_pos_packed] = Zs_packed
+            self.component_labels_[valid_pos_packed] = labels_packed
+        else:
+            # no observed sites at all: keep the caller's weights as passed
+            self.w = w
+            self.star = star
+
+        self.p_norm = stats.norm.sf(np.abs(self.Zs))
+
+        if permutations:
+            if n_valid and active.any():
+                self_weights = adjacency.diagonal().astype(np.float64)
+                adj_off = adjacency.copy()
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    adj_off.setdiag(0)
+                    adj_off.eliminate_zeros()
+                adj_off = adj_off.tocsr()
+                adj_off.sort_indices()
+                other_weights = adj_off.data.astype(np.float64)
+                cardinalities = np.asarray((adj_off != 0).sum(axis=1)).flatten()
+                p_sims, rlocals = crand_components(
+                    y_packed,
+                    Gs_packed,
+                    active,
+                    comp_ptr,
+                    cardinalities,
+                    self_weights,
+                    other_weights,
+                    comp_sum,
+                    seed,
+                    permutations,
+                    keep_simulations,
+                    n_jobs,
+                    _g_local_star_crand if self.star else _g_local_crand,
+                    island_weight=island_weight,
+                    alternative=alternative,
+                )
+            else:
+                p_sims = np.full(n_valid, np.nan, dtype=np.float32)
+                rlocals = (
+                    np.full((n_valid, permutations), np.nan)
+                    if keep_simulations
+                    else np.empty((1, 1))
+                )
+            self.p_sim = np.full(n, np.nan)
+            if n_valid:
+                self.p_sim[valid_pos_packed] = p_sims
+            if keep_simulations:
+                self.rGs = np.full((n, permutations), np.nan)
+                if n_valid:
+                    self.rGs[valid_pos_packed] = rlocals
+                self.sim = self.rGs.T
+                self.EG_sim = self.sim.mean(axis=0)
+                self.seG_sim = self.sim.std(axis=0)
+                self.VG_sim = self.seG_sim * self.seG_sim
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    self.z_sim = (self.Gs - self.EG_sim) / self.seG_sim
+                self.p_z_sim = stats.norm.sf(np.abs(self.z_sim))
+            else:
+                self.rGs = np.empty((1, 1))
 
     def __crand(self, keep_simulations):
         warnings.warn(

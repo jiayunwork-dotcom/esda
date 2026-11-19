@@ -9,7 +9,7 @@ __author__ = (
     "Levi John Wolf <levi.john.wolf@gmail.com>"
 )
 
-from warnings import simplefilter, warn
+from warnings import catch_warnings, simplefilter, warn
 
 import numpy as np
 import pandas as pd
@@ -18,7 +18,12 @@ from libpysal.weights import W
 from libpysal.weights.spatial_lag import lag_spatial
 from scipy import sparse
 
-from .crand import _prepare_univariate
+from .crand import (
+    _prepare_univariate,
+    crand_components,
+    mask_unobserved,
+    rebuild_sparse_weights,
+)
 from .crand import crand as _crand_plus
 from .crand import njit as _njit
 from .significance import calculate_significance
@@ -1291,6 +1296,28 @@ class Moran_Local:
     alternative : None | str = None
         The alternative hypothesis for conditional randomization.
         See ``crand.crand()`` for complete description.
+    by_component : bool
+        (default=False) If True, the analysis is decomposed over the
+        weakly connected components of the graph induced by the observed
+        (non-NaN) sites. Sites with a missing value are dropped from the
+        graph together with all of their edges before the components are
+        computed, so a missing observation can split a network into
+        separate pieces. Each component is standardised on its own
+        observations, and conditional randomization only draws from the
+        remaining sites of the same component. Results are reported at
+        the original site positions; sites without a valid statistic
+        (missing observations, components with fewer than three observed
+        sites, and constant components) are returned as NaN (``q`` is 0
+        there). The input ``y`` and ``w`` are never modified, and
+        ``self.w`` then holds the transformed weights of the observed
+        subgraph. The default (False) keeps the whole-graph analysis.
+    component_labels_ : array
+        (only set when ``by_component=True``) (n,) component id of every
+        site in the observed graph; -1 marks sites dropped because their
+        value is NaN. In this mode ``den`` holds one ``sum(z**2)``
+        denominator per component (NaN for degenerate components) and
+        ``sim`` keeps one column per original site, with all-NaN columns
+        where no statistic was computed.
 
     Notes
     -----
@@ -1343,8 +1370,22 @@ class Moran_Local:
         seed=None,
         island_weight=0,  # noqa: ARG002 - Unused method argument: `island_weight`
         alternative=None,
+        by_component=False,
     ):
         y = np.asarray(y).flatten()
+        if by_component:
+            self._init_by_component(
+                y,
+                w,
+                transformation,
+                permutations,
+                geoda_quads,
+                n_jobs,
+                keep_simulations,
+                seed,
+                alternative,
+            )
+            return
         self.y = y
         n = len(y)
         self.n = n
@@ -1398,6 +1439,217 @@ class Moran_Local:
                     self.z_sim = (self.Is - self.EI_sim) / self.seI_sim
                 self.p_z_sim = stats.norm.sf(np.abs(self.z_sim))
             else:
+                self.sim = self.rlisas = None
+                self.EI_sim = np.nan
+                self.seI_sim = np.nan
+                self.VI_sim = np.nan
+                self.z_sim = np.nan
+                self.p_z_sim = np.nan
+
+    def _init_by_component(
+        self,
+        y,
+        w,
+        transformation,
+        permutations,
+        geoda_quads,
+        n_jobs,
+        keep_simulations,
+        seed,
+        alternative,
+    ):
+        """Component-wise local Moran inference (see ``by_component``)."""
+        n = len(y)
+        if w.n != n:
+            raise ValueError(
+                f"Length of y ({n}) does not match the number of "
+                f"observations in w ({w.n})."
+            )
+        if np.isinf(y).any():
+            raise ValueError(
+                "y contains infinite values; only finite values or NaN are supported."
+            )
+        self.y = y
+        self.n = n
+        self.n_1 = n - 1
+        self.permutations = permutations
+        self.geoda_quads = geoda_quads
+        quads = [1, 2, 3, 4]
+        if geoda_quads:
+            quads = [1, 3, 2, 4]
+        self.quads = quads
+
+        # outputs at original positions; missing unless computed
+        self.z = np.full(n, np.nan)
+        self.Is = np.full(n, np.nan)
+        self.q = np.zeros(n, dtype=int)
+        self.EI = np.full(n, np.nan)
+        self.VI = np.full(n, np.nan)
+        self.EIc = np.full(n, np.nan)
+        self.VIc = np.full(n, np.nan)
+        # component id per original site; -1 marks unobserved sites
+        self.component_labels_ = np.full(n, -1, dtype=int)
+
+        valid, adj_observed, _, comp_ptr, perm = mask_unobserved(y, w.sparse)
+        n_valid = perm.shape[0]
+        n_comp = comp_ptr.shape[0] - 1
+        # per-component denominator sum(z**2); NaN for degenerate components
+        self.den = np.full(n_comp, np.nan)
+        valid_pos = np.flatnonzero(valid)
+        valid_pos_packed = valid_pos[perm]
+        active_full = np.zeros(n, dtype=bool)
+        active = np.zeros(0, dtype=bool)
+
+        if n_valid:
+            # rebuild the weights on the observed subgraph and let the
+            # requested transformation act on the retained edges only;
+            # the caller's weights object is never modified
+            w_observed = rebuild_sparse_weights(w, adj_observed)
+            w_observed = _transform(w_observed, transformation)
+            self.w = w_observed
+            adjacency = w_observed.sparse[perm][:, perm].tocsr()
+            adjacency.eliminate_zeros()
+
+            y_packed = y[valid][perm]
+            sizes = np.diff(comp_ptr)
+            labels_packed = np.repeat(np.arange(n_comp), sizes)
+
+            # standardise on each component's own observations
+            comp_sum = np.bincount(labels_packed, weights=y_packed, minlength=n_comp)
+            comp_mean = comp_sum / sizes
+            centered = y_packed - comp_mean[labels_packed]
+            comp_var = (
+                np.bincount(labels_packed, weights=centered**2, minlength=n_comp)
+                / sizes
+            )
+            comp_std = np.sqrt(comp_var)
+            active_comp = (sizes >= 3) & (comp_std > 0)
+
+            z_packed = np.full(n_valid, np.nan)
+            active = active_comp[labels_packed]
+            z_packed[active] = centered[active] / comp_std[labels_packed][active]
+
+            den = self.den
+            den[active_comp] = np.bincount(
+                labels_packed[active], weights=z_packed[active] ** 2, minlength=n_comp
+            )[active_comp]
+
+            n_c = sizes[labels_packed]
+            # components are disconnected, so NaNs never leak across them
+            z_lag = adjacency @ z_packed
+            Is_packed = (n_c - 1) * z_packed * z_lag / den[labels_packed]
+            # sites without a statistic get no permutation either
+            active &= np.isfinite(Is_packed)
+
+            # quadrants from the component-standardised values
+            zp = z_packed > 0
+            lp = z_lag > 0
+            q0, q1, q2, q3 = self.quads
+            q_packed = (
+                q0 * (zp & lp) + q1 * (~zp & lp) + q2 * (~zp & ~lp) + q3 * (zp & ~lp)
+            )
+            q_packed[~active] = 0
+
+            # analytical moments, with each component's own n and moments
+            with np.errstate(all="ignore"):
+                m2 = den[labels_packed] / n_c
+                wi = np.asarray(adjacency.sum(axis=1)).flatten()
+                wi2 = np.asarray(adjacency.multiply(adjacency).sum(axis=1)).flatten()
+                n1 = n_c - 1
+                EIc = -(z_packed**2 * wi) / (n1 * m2)
+                VIc = (
+                    (z_packed / m2) ** 2
+                    * (n_c / (n_c - 2))
+                    * (wi2 - (wi**2) / n1)
+                    * (m2 - (z_packed**2) / n1)
+                )
+                m4 = (
+                    np.bincount(labels_packed, weights=z_packed**4, minlength=n_comp)
+                    / sizes
+                )
+                b2 = (m4 / (den / sizes) ** 2)[labels_packed]
+                EI = -wi / n1
+                VI = wi2 * (n_c - b2) / n1
+                VI += (wi**2 - wi2) * (2 * b2 - n_c) / (n1 * (n_c - 2))
+                VI -= (-wi / n1) ** 2
+            # degenerate components report missing moments as well
+            EI[~active_comp[labels_packed]] = np.nan
+            VI[~active_comp[labels_packed]] = np.nan
+            EIc[~active_comp[labels_packed]] = np.nan
+            VIc[~active_comp[labels_packed]] = np.nan
+
+            self.z[valid_pos_packed] = z_packed
+            self.Is[valid_pos_packed] = Is_packed
+            self.q[valid_pos_packed] = q_packed
+            self.EI[valid_pos_packed] = EI
+            self.VI[valid_pos_packed] = VI
+            self.EIc[valid_pos_packed] = EIc
+            self.VIc[valid_pos_packed] = VIc
+            self.component_labels_[valid_pos_packed] = labels_packed
+            active_full[valid_pos_packed] = active
+        else:
+            # no observed sites at all: keep the caller's weights as passed
+            self.w = w
+
+        if permutations:
+            effective_alternative = "directed" if alternative is None else alternative
+            if n_valid and active.any():
+                self_weights = adjacency.diagonal().astype(np.float64)
+                adj_off = adjacency.copy()
+                with catch_warnings():
+                    simplefilter("ignore")
+                    adj_off.setdiag(0)
+                    adj_off.eliminate_zeros()
+                adj_off = adj_off.tocsr()
+                adj_off.sort_indices()
+                other_weights = adj_off.data.astype(np.float64)
+                cardinalities = np.asarray((adj_off != 0).sum(axis=1)).flatten()
+                scaling = (sizes - 1) / den
+                p_sims, rlocals = crand_components(
+                    z_packed,
+                    Is_packed,
+                    active,
+                    comp_ptr,
+                    cardinalities,
+                    self_weights,
+                    other_weights,
+                    scaling,
+                    seed,
+                    permutations,
+                    keep_simulations,
+                    n_jobs,
+                    _moran_local_crand,
+                    alternative=alternative,
+                )
+            else:
+                p_sims = np.full(n_valid, np.nan, dtype=np.float32)
+                rlocals = (
+                    np.full((n_valid, permutations), np.nan)
+                    if keep_simulations
+                    else np.empty((1, 1))
+                )
+
+            if keep_simulations:
+                self.rlisas = np.full((n, permutations), np.nan)
+                if n_valid:
+                    self.rlisas[valid_pos_packed] = rlocals
+                self.sim = self.rlisas.T
+                p_sim = calculate_significance(
+                    self.Is, self.rlisas, alternative=effective_alternative
+                )
+                p_sim = np.atleast_1d(np.asarray(p_sim, dtype=np.float64))
+                p_sim[~active_full] = np.nan
+                self.p_sim = p_sim
+                self.EI_sim = self.sim.mean(axis=0)
+                self.seI_sim = self.sim.std(axis=0)
+                self.VI_sim = self.seI_sim * self.seI_sim
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    self.z_sim = (self.Is - self.EI_sim) / self.seI_sim
+                self.p_z_sim = stats.norm.sf(np.abs(self.z_sim))
+            else:
+                self.p_sim = np.full(n, np.nan)
+                if n_valid:
+                    self.p_sim[valid_pos_packed] = p_sims
                 self.sim = self.rlisas = None
                 self.EI_sim = np.nan
                 self.seI_sim = np.nan
