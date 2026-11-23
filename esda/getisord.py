@@ -16,13 +16,32 @@ from scipy import stats
 from .crand import (
     _prepare_univariate,
     crand_components,
+    degenerate_reference_columns,
     mask_unobserved,
     rebuild_sparse_weights,
+    transform_observed,
 )
 from .crand import crand as _crand_plus
 from .crand import njit as _njit
 
 PERMUTATIONS = 999
+
+
+class _StarUnset:
+    """Sentinel marking a ``star`` argument the caller did not pass.
+
+    ``G_Local`` documents ``star=False`` as its whole-graph default, but in
+    the component reading an omitted ``star`` means "resolve Gi/Gi* from
+    each component's retained diagonal" (the same as an explicit ``None``).
+    Keeping the sentinel private lets both behaviours coexist without
+    changing the whole-graph default.
+    """
+
+    def __repr__(self):  # pragma: no cover - cosmetic
+        return "None"
+
+
+_STAR_UNSET = _StarUnset()
 
 
 class G:
@@ -212,7 +231,13 @@ class G_Local:
         If the row-transformed weight is provided, then this is the default
         value to use within the spatial lag. Generally, weights should be
         provided in binary form, and standardization/self-weighting will be
-        handled by the function itself.
+        handled by the function itself. A number sets the self-weight
+        explicitly. In the component reading (``by_component=True``) an
+        omitted ``star`` means the same as ``None``: the Gi/Gi* variant is
+        inferred per component from the retained diagonal, ``False``
+        selects Gi, ``True`` selects Gi*, and a number is used as the
+        self-weight. The whole-graph reading (``by_component=False``)
+        keeps its historical default of ``False``.
     seed : None or int
         Seed to ensure reproducibility of conditional randomizations. Must be
         set here, and not outside of the function, since numba does not
@@ -232,14 +257,17 @@ class G_Local:
         graph together with all of their edges before the components are
         computed, so a missing observation can split a network into
         separate pieces. Each component normalises its statistic on its
-        own observations, the Gi/Gi* (``star``) handling is resolved on
-        the retained weights, and conditional randomization only draws
-        from the remaining sites of the same component. Results are
-        reported at the original site positions; sites without a valid
-        statistic (missing observations, components with fewer than
-        three observed sites, constant components, and cells whose
-        denominator is zero) are returned as NaN. The input ``y`` and
-        ``w`` are never modified, and ``self.w`` then holds the
+        own observations, the Gi/Gi* (``star``) handling is resolved per
+        component on the retained weights, and conditional randomization
+        only draws from the remaining sites of the same component. A
+        site that is attached to its component only through incoming
+        edges (for example a site whose only outgoing weight is a
+        self-loop) is still part of the component and is analysed as
+        such. Results are reported at the original site positions; sites
+        without a valid statistic (missing observations, components with
+        fewer than three observed sites, constant components, and cells
+        whose denominator is zero) are returned as NaN. The input ``y``
+        and ``w`` are never modified, and ``self.w`` then holds the
         transformed weights of the observed subgraph. The default
         (False) keeps the whole-graph analysis.
     component_labels_ : array
@@ -282,10 +310,13 @@ class G_Local:
     seG_sim : array
         Standard deviation of G under permutations.
     z_sim : array
-        Standardized G based on permutations.
+        Standardized G based on permutations. NaN where the simulated
+        reference distribution has no spread (for example a Gi* site whose
+        focal value and self-weight exhaust its component), since the
+        standardisation is then undefined.
     p_z_sim : array
         P-values based on the standard normal approximation from permutations
-        (one-sided).
+        (one-sided). NaN wherever ``z_sim`` is undefined.
 
     Notes
     -----
@@ -378,7 +409,7 @@ class G_Local:
         w,
         transform="R",
         permutations=PERMUTATIONS,
-        star=False,
+        star=_STAR_UNSET,
         keep_simulations=True,
         n_jobs=-1,
         seed=None,
@@ -401,6 +432,11 @@ class G_Local:
                 alternative,
             )
             return
+        # whole-graph reading: an omitted ``star`` keeps its historical
+        # Gi default (False); only the by-component reading treats an
+        # omitted value as "infer the self-weight per component".
+        if star is _STAR_UNSET:
+            star = False
         self.n = len(y)
         self.y = y
         w, star = _infer_star_and_structure_w(w, star, transform)
@@ -460,6 +496,11 @@ class G_Local:
             raise ValueError(
                 "y contains infinite values; only finite values or NaN are supported."
             )
+        # In the component reading an omitted ``star`` means "infer Gi/Gi*
+        # from each component's retained diagonal", exactly like an
+        # explicit ``None``.
+        if star is _STAR_UNSET:
+            star = None
         self.n = n
         self.y = y
         self.permutations = permutations
@@ -481,15 +522,39 @@ class G_Local:
         valid_pos = np.flatnonzero(valid)
         valid_pos_packed = valid_pos[perm]
         active = np.zeros(0, dtype=bool)
+        self.star = star if isinstance(star, (bool, np.bool_)) else False
 
         if n_valid:
-            # the Gi/Gi* (star) handling and the transform act on the
-            # retained edges only; the caller's weights object is never
-            # modified
+            # the caller's weights object is never modified: the observed
+            # subgraph is rebuilt, Gi/Gi* is resolved per component on the
+            # retained edges, and only then is the requested transform
+            # applied (matching the whole-graph order)
             w_observed = rebuild_sparse_weights(w, adj_observed)
-            w_observed, star = _infer_star_and_structure_w(w_observed, star, transform)
+            adjacency = w_observed.sparse[perm][:, perm].tocsr()
+            adjacency.eliminate_zeros()
+            # an array-valued ``star`` is indexed by observed-site position;
+            # reorder it into component-major order to match ``adjacency``
+            star_for_components = star
+            if (
+                star is not None
+                and not isinstance(star, (bool, np.bool_))
+                and np.asarray(star).ndim == 1
+            ):
+                star_for_components = np.asarray(star, dtype=np.float64)[perm]
+            adjacency, star_any = _resolve_component_star(
+                adjacency, comp_ptr, star_for_components, transform
+            )
+            self.star = star_any
+            # write the resolved diagonal back to original-observed order
+            # and rebuild the weights object before transforming it
+            resolved_diag = adjacency.diagonal().astype(np.float64)
+            inv_perm = np.empty_like(perm)
+            inv_perm[perm] = np.arange(perm.shape[0])
+            resolved_obs = adj_observed.astype(np.float64).tolil(copy=True)
+            resolved_obs.setdiag(resolved_diag[inv_perm])
+            w_observed = rebuild_sparse_weights(w, resolved_obs.tocsr())
+            w_observed = transform_observed(w_observed, transform)
             self.w = w_observed
-            self.star = star
             adjacency = w_observed.sparse[perm][:, perm].tocsr()
             adjacency.eliminate_zeros()
 
@@ -503,7 +568,22 @@ class G_Local:
             comp_max = np.maximum.reduceat(y_packed, comp_ptr[:-1])
             active_comp = (sizes >= 3) & (comp_min != comp_max)
 
-            remove_self = not star
+            # Gi/Gi* is a property of the component, exactly as if each
+            # component were handed to the whole-graph estimator on its own:
+            # a component with any retained self-loop is Gi* for every one
+            # of its sites (sites without a loop simply carry a zero
+            # self-weight), otherwise it is Gi. This matters when components
+            # with and without self-loops are mixed in one table.
+            self_weights = adjacency.diagonal().astype(np.float64)
+            loop_site = self_weights != 0
+            star_comp = np.zeros(n_comp, dtype=bool)
+            if n_comp:
+                star_comp = np.maximum.reduceat(
+                    loop_site.astype(np.int64), comp_ptr[:-1]
+                ).astype(bool)
+            star_site = star_comp[labels_packed]
+
+            remove_self = ~star_site
             n_c = sizes[labels_packed]
             N_c = n_c - remove_self
             y_sum = comp_sum[labels_packed]
@@ -530,9 +610,10 @@ class G_Local:
                 expected_variance *= empirical_variance / (empirical_mean**2)
                 Zs_packed = (Gs_packed - expected_value) / np.sqrt(expected_variance)
             # degenerate components report missing moments as well
-            expected_value[~active_comp[labels_packed]] = np.nan
-            expected_variance[~active_comp[labels_packed]] = np.nan
-            Zs_packed[~active_comp[labels_packed]] = np.nan
+            degenerate = ~active_comp[labels_packed]
+            expected_value[degenerate] = np.nan
+            expected_variance[degenerate] = np.nan
+            Zs_packed[degenerate] = np.nan
 
             self.y_sum[valid_pos_packed] = y_sum
             self.Gs[valid_pos_packed] = Gs_packed
@@ -543,7 +624,6 @@ class G_Local:
         else:
             # no observed sites at all: keep the caller's weights as passed
             self.w = w
-            self.star = star
 
         self.p_norm = stats.norm.sf(np.abs(self.Zs))
 
@@ -559,6 +639,12 @@ class G_Local:
                 adj_off.sort_indices()
                 other_weights = adj_off.data.astype(np.float64)
                 cardinalities = np.asarray((adj_off != 0).sum(axis=1)).flatten()
+                # The Gi* kernel reduces to the Gi kernel when the site's
+                # fixed self-weight is zero, so one kernel serves a table
+                # that mixes both variants. The per-site denominator
+                # (``den``) is what distinguishes them: a Gi site divides
+                # by the component sum minus its own value, a Gi* site by
+                # the whole component sum.
                 p_sims, rlocals = crand_components(
                     y_packed,
                     Gs_packed,
@@ -567,12 +653,12 @@ class G_Local:
                     cardinalities,
                     self_weights,
                     other_weights,
-                    comp_sum,
+                    den,
                     seed,
                     permutations,
                     keep_simulations,
                     n_jobs,
-                    _g_local_star_crand if self.star else _g_local_crand,
+                    _g_local_star_crand,
                     island_weight=island_weight,
                     alternative=alternative,
                 )
@@ -594,8 +680,14 @@ class G_Local:
                 self.EG_sim = self.sim.mean(axis=0)
                 self.seG_sim = self.sim.std(axis=0)
                 self.VG_sim = self.seG_sim * self.seG_sim
+                # See ``Moran_Local``: a degenerate reference distribution
+                # leaves the standardisation undefined, so keep the
+                # interface's undefined representation rather than a
+                # spurious finite score computed from rounding noise.
+                degenerate_col = degenerate_reference_columns(self.sim)
                 with np.errstate(divide="ignore", invalid="ignore"):
                     self.z_sim = (self.Gs - self.EG_sim) / self.seG_sim
+                self.z_sim[degenerate_col] = np.nan
                 self.p_z_sim = stats.norm.sf(np.abs(self.z_sim))
             else:
                 self.rGs = np.empty((1, 1))
@@ -692,6 +784,109 @@ class G_Local:
     def _statistic(self):
         """Standardized accessor for esda statistics"""
         return self.Gs
+
+
+def _resolve_component_star(adjacency, comp_ptr, star, transform):
+    """Resolve the Gi/Gi* self-weight rule independently per component.
+
+    The whole-graph helper :func:`_infer_star_and_structure_w` decides
+    ``star`` once for the entire matrix. In the component reading a single
+    table may mix components that carry self-loops with components that do
+    not, so the decision (and any default self-weight that has to be
+    filled in) is per component. The weights are still untransformed here;
+    the caller applies the requested transform afterwards, exactly as the
+    whole-graph path does, so a binary transform binarises a numeric
+    self-weight and a row-standardised transform includes it in the row
+    sum.
+
+    Parameters
+    ----------
+    adjacency : scipy.sparse.csr_matrix
+        Retained weights in component-major order, before the requested
+        transform.
+    comp_ptr : ndarray
+        (n_components + 1,) component offsets in ``adjacency``.
+    star : None | bool | float | ndarray
+        The caller's ``star`` setting. ``None`` asks to infer it from each
+        component's retained diagonal; ``False`` selects Gi, ``True``
+        selects Gi*, and a number is used as the self-weight, following
+        the existing rules (``transform`` decides the binary/row-standard
+        default when the component has no diagonal).
+    transform : str
+        Requested transform, ``'B'`` or ``'R'``.
+
+    Returns
+    -------
+    adjacency : scipy.sparse.csr_matrix
+        A copy with the resolved diagonal. The caller's matrix is not
+        modified.
+    star : bool
+        Whether any component ends up as Gi* (matches the whole-graph
+        convention for ``self.star``).
+    """
+    if transform.lower() not in ("r", "b"):
+        raise AssertionError(
+            f'Transforms must be binary "b" or row-standardized "r". '
+            f"Recieved: {transform}"
+        )
+    adjacency = adjacency.tocsr(copy=True)
+    n_valid = adjacency.shape[0]
+    n_comp = comp_ptr.shape[0] - 1
+    star_warn = (
+        "Gi* requested, but (a) weights are already row-standardized,"
+        " (b) no weights are on the diagonal, and"
+        " (c) no default value supplied to star. Assuming that the"
+        " self-weight is equivalent to the maximum weight in the"
+        " row. To use a different default (like, .5), set `star=.5`,"
+        " or use libpysal.weights.fill_diagonal() to set the diagonal"
+        " values of your weights matrix and use `star=None` in Gi_Local."
+    )
+
+    # a numeric / array self-weight applies to every site; booleans and
+    # None are resolved from each component's retained diagonal below
+    if star is not None and not isinstance(star, (bool, np.bool_)):
+        try:
+            cand = np.asarray(star, dtype=np.float64)
+        except (TypeError, ValueError):
+            raise TypeError(
+                f"Type of star ({type(star)}) not understood."
+                " Must be an integer, boolean, float, or numpy.ndarray."
+            ) from None
+        if cand.ndim == 0:
+            self_weights = np.full(n_valid, float(cand))
+        elif cand.shape == (n_valid,):
+            self_weights = cand.astype(np.float64).copy()
+        else:
+            raise TypeError(
+                f"Type of star ({type(star)}) not understood."
+                " Must be an integer, boolean, float, or numpy.ndarray."
+            )
+        adjacency.setdiag(self_weights)
+        adjacency.eliminate_zeros()
+        return adjacency, bool((self_weights > 0).any())
+
+    diag = adjacency.diagonal().astype(np.float64)
+    self_weights = diag.copy()
+    star_any = False
+    for c in range(n_comp):
+        s, e = int(comp_ptr[c]), int(comp_ptr[c + 1])
+        nonzero = diag[s:e] != 0
+        resolved = bool(nonzero.any()) if star is None else bool(star)
+        if not resolved:
+            self_weights[s:e] = 0.0
+        elif nonzero.any():
+            pass  # keep this component's own diagonal
+        elif transform.lower() == "b":
+            self_weights[s:e] = 1.0
+        else:  # 'r': historical "row maximum" default, per component
+            warnings.warn(star_warn, UserWarning, stacklevel=3)
+            row_max = np.asarray(adjacency[s:e].max(axis=1).todense()).flatten()
+            self_weights[s:e] = row_max
+        star_any = star_any or resolved
+
+    adjacency.setdiag(self_weights)
+    adjacency.eliminate_zeros()
+    return adjacency, star_any
 
 
 def _infer_star_and_structure_w(weights, star, transform):

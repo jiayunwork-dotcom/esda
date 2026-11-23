@@ -28,8 +28,8 @@ from handmade import (
     COMP_A,
     COMP_B,
     MISSING_AT,
-    N,
     Y_FULL,
+    N,
     adjacency,
     make_graph,
     make_w,
@@ -618,6 +618,216 @@ def _():
         warnings.simplefilter("always")
         moran(y, make_w(adjacency()), alternative=None)
     assert any(issubclass(w.category, DeprecationWarning) for w in caught)
+
+
+def _w(adj):
+    """make_w for a NumPy adjacency array."""
+    return make_w(sparse.csr_matrix(np.asarray(adj)))
+
+
+def _g(adj):
+    """make_graph for a NumPy adjacency array."""
+    return make_graph(sparse.csr_matrix(np.asarray(adj)))
+
+
+# ----------------------------------------------------------------------
+# 21. the reported failure: a self-loop-only outgoing site is not an island
+# ----------------------------------------------------------------------
+def _selfloop_chain():
+    """Readings [1, 3, 8]; directed edges 0->1, 1->2 and 2->2, weights 1."""
+    adj = np.zeros((3, 3))
+    adj[0, 1] = 1.0
+    adj[1, 2] = 1.0
+    adj[2, 2] = 1.0
+    return adj, np.array([1.0, 3.0, 8.0])
+
+
+@check("self-loop: observed and simulated statistics are non-zero")
+def _():
+    adj, y = _selfloop_chain()
+    for w in (_w(adj), _g(adj)):
+        lg = G_Local(
+            y, w, transform="B", star=True, permutations=97, seed=6421,
+            alternative=ALT, by_component=True,
+        )
+        lm = Moran_Local(
+            y, w, transformation="B", permutations=97, seed=6421,
+            alternative=ALT, by_component=True,
+        )
+        np.testing.assert_allclose(lg.Gs[2], 2 / 3, rtol=1e-12)
+        np.testing.assert_allclose(lm.Is[2], 1.2307692307692306, rtol=1e-12)
+        np.testing.assert_allclose(lg.sim[:, 2], 2 / 3, rtol=1e-12)
+        np.testing.assert_allclose(lm.sim[:, 2], 1.2307692307692306, rtol=1e-12)
+        assert (lg.sim[:, 2] != 0).all()
+        assert (lm.sim[:, 2] != 0).all()
+
+
+@check("self-loop: simulated draws lie in the enumerated conditional support")
+def _():
+    import itertools
+
+    adj, y = _selfloop_chain()
+    n = 3
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        lm = Moran_Local(
+            y, _w(adj), transformation="B", permutations=97, seed=6421,
+            alternative=ALT, by_component=True,
+        )
+        lg = G_Local(
+            y, _w(adj), transform="B", star=True, permutations=97, seed=6421,
+            alternative=ALT, by_component=True,
+        )
+    z = lm.z
+    total_z2 = (z * z).sum()
+    adj_off = adj.copy()
+    np.fill_diagonal(adj_off, 0.0)
+    for i in range(n):
+        others = [k for k in range(n) if k != i]
+        moran_support = set()
+        g_support = set()
+        for order in itertools.permutations(others):
+            zp = np.empty(n)
+            zp[i] = z[i]
+            zp[list(order)] = z[others]
+            moran_support.add(round((n - 1) * zp[i] * (adj[i] @ zp) / total_z2, 9))
+            yp = np.empty(n)
+            yp[i] = y[i]
+            yp[list(order)] = y[others]
+            g_support.add(round((adj_off[i] @ yp + adj[i, i] * y[i]) / y.sum(), 9))
+        assert {round(float(v), 9) for v in lm.sim[:, i]} <= moran_support
+        assert {round(float(v), 9) for v in lg.sim[:, i]} <= g_support
+
+
+@check("self-loop: analytical moments follow each null")
+def _():
+    import itertools
+
+    adj, y = _selfloop_chain()
+    n = 3
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        lm = Moran_Local(
+            y, _w(adj), transformation="B", permutations=0, by_component=True,
+        )
+    z = lm.z
+    m2 = (z * z).sum() / n
+    # Sokal-convention statistic j_i = z_i (A z)_i / m2
+    cond_means, cond_vars = [], []
+    for i in range(n):
+        others = [k for k in range(n) if k != i]
+        vals = []
+        for order in itertools.permutations(others):
+            zp = np.empty(n)
+            zp[i] = z[i]
+            zp[list(order)] = z[others]
+            vals.append(zp[i] * (adj[i] @ zp) / m2)
+        cond_means.append(np.mean(vals))
+        cond_vars.append(np.var(vals))
+    total = np.array(
+        [z[list(p)] * (adj @ z[list(p)]) / m2 for p in itertools.permutations(range(n))]
+    )
+    np.testing.assert_allclose(lm.EIc, cond_means, rtol=1e-10, atol=1e-10)
+    np.testing.assert_allclose(lm.VIc, cond_vars, rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(lm.EI, total.mean(axis=0), rtol=1e-10, atol=1e-10)
+    np.testing.assert_allclose(lm.VI, total.var(axis=0), rtol=1e-9, atol=1e-9)
+    assert lm.EI[2] != lm.EIc[2]  # the two nulls differ
+
+
+# ----------------------------------------------------------------------
+# 22. Gi/Gi* resolved per component; omitted star equals None in this mode
+# ----------------------------------------------------------------------
+def _mixed_components():
+    """{0,1,2} triangle with a loop (Gi*) and {3,4,5} triangle (Gi)."""
+    adj = np.zeros((6, 6))
+    for i, j in [(0, 1), (1, 2), (0, 2)]:
+        adj[i, j] = adj[j, i] = 1.0
+    adj[2, 2] = 1.0
+    for i, j in [(3, 4), (4, 5), (3, 5)]:
+        adj[i, j] = adj[j, i] = 1.0
+    return adj, np.array([1.0, 2.0, 4.0, 10.0, 12.0, 14.0])
+
+
+@check("mixed components: Gi/Gi* resolved per component")
+def _():
+    adj, y = _mixed_components()
+    for star in (None, True, False, 0.5):
+        full = getis(y, _w(adj), transform="B", star=star)
+        a = getis(y[:3], _w(adj[:3, :3]), transform="B", star=star)
+        b = getis(y[3:], _w(adj[3:, 3:]), transform="B", star=star)
+        for name in ("Gs", "EGs", "VGs", "Zs"):
+            np.testing.assert_array_equal(
+                np.r_[getattr(full, name)[:3], getattr(full, name)[3:]],
+                np.r_[getattr(a, name), getattr(b, name)],
+                err_msg=f"{name} star={star}",
+            )
+
+
+@check("mixed components: omitted star behaves like None in component mode")
+def _():
+    adj, y = _mixed_components()
+    omitted = G_Local(
+        y, _w(adj), transform="B", permutations=PERMS, seed=SEED,
+        alternative=ALT, by_component=True,
+    )
+    explicit = getis(y, _w(adj), transform="B", star=None)
+    np.testing.assert_array_equal(omitted.Gs, explicit.Gs)
+    np.testing.assert_array_equal(omitted.sim, explicit.sim)
+    np.testing.assert_array_equal(omitted.p_sim, explicit.p_sim)
+    assert omitted.star is True
+
+
+@check("mixed components: whole-graph omitted star keeps its False default")
+def _():
+    adj, y = _mixed_components()
+    omitted = G_Local(y, _w(adj), transform="B", permutations=0)
+    explicit = G_Local(y, _w(adj), transform="B", star=False, permutations=0)
+    np.testing.assert_array_equal(omitted.Gs, explicit.Gs)
+    assert not omitted.star
+
+
+@check("mixed components: extraction, sandwich, n_jobs and saving agree")
+def _():
+    adj, y = _mixed_components()
+    order = np.array([3, 4, 5, 0, 1, 2])
+    y2 = y[order]
+    adj2 = adj[np.ix_(order, order)]
+    for cls, stat, kw in (
+        (moran, "Is", {}),
+        (getis, "Gs", {"transform": "B", "star": None}),
+    ):
+        base = cls(y, _w(adj), **kw)
+        moved = cls(y2, _w(adj2), **kw)
+        parallel = cls(y, _w(adj), n_jobs=2, **kw)
+        dropped = cls(y, _w(adj), keep_simulations=False, **kw)
+        alone_a = cls(y[:3], _w(adj[:3, :3]), **kw)
+        np.testing.assert_array_equal(getattr(base, stat)[:3], getattr(alone_a, stat))
+        np.testing.assert_array_equal(base.sim[:, :3], alone_a.sim)
+        np.testing.assert_array_equal(base.p_sim[:3], alone_a.p_sim)
+        np.testing.assert_array_equal(getattr(moved, stat), getattr(base, stat)[order])
+        np.testing.assert_array_equal(moved.sim, base.sim[:, order])
+        np.testing.assert_array_equal(moved.p_sim, base.p_sim[order])
+        np.testing.assert_array_equal(parallel.sim, base.sim)
+        np.testing.assert_array_equal(parallel.p_sim, base.p_sim)
+        np.testing.assert_allclose(dropped.p_sim, base.p_sim, equal_nan=True)
+
+
+@check("in-edge only site with a self-loop stays in its component")
+def _():
+    adj = np.zeros((4, 4))
+    adj[0, 1] = 1.0
+    adj[1, 0] = 1.0
+    adj[1, 2] = 1.0  # site 2 only has an incoming edge plus a self-loop
+    adj[2, 2] = 1.0
+    y = np.array([1.0, 3.0, 8.0, 2.0])
+    for cls, stat in ((moran, "Is"), (getis, "Gs")):
+        full = cls(y, _w(adj))
+        alone = cls(y[:3], _w(adj[:3, :3]))
+        np.testing.assert_array_equal(getattr(full, stat)[:3], getattr(alone, stat))
+        np.testing.assert_array_equal(full.sim[:, :3], alone.sim)
+        np.testing.assert_array_equal(full.p_sim[:3], alone.p_sim)
+        assert np.isnan(getattr(full, stat)[3])
+        assert (full.sim[:, 2] != 0).any()
 
 
 def main():

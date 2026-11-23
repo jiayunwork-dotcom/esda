@@ -28,6 +28,14 @@ Exit status is 0 only if every check passes. The run takes about a minute
   calls and requires them to match, guarding the default behaviour.
 - `reference_default_mode.npz` — the stored reference results.
 
+The focused unit tests for the self-weight fixes live in
+`esda/tests/test_by_component_selfweight.py` and run with the rest of the
+esda suite:
+
+```sh
+python -m pytest esda/tests/test_by_component_selfweight.py
+```
+
 To regenerate the reference (only when the old entry points intentionally
 change):
 
@@ -57,3 +65,17 @@ python regression_by_component/check_by_component.py --rewrite-reference
    zero-denominator cell (whose value still feeds the other draws), the
    all-missing table, both `keep_simulations` modes, and input
    immutability.
+7. Self-weight handling on directed, self-loop-only sites (the reported
+   failure): a site whose only outgoing edge is a self-loop is still in its
+   component through its incoming edges, so its observed statistic and every
+   simulated value are the conditional value fixed by its focal reading and
+   self-weight — never the zero island placeholder. The simulated draws lie
+   in the enumerated conditional support (the focal value and self-weight are
+   fixed, the other sites are drawn without replacement), and the analytical
+   moments match the null they belong to: `EIc`/`VIc` the conditional null,
+   `EI`/`VI` the total-randomisation null.
+8. Gi/Gi* resolved per component when looped and loop-free components are
+   mixed in one table, and an omitted `star` in component mode behaves like
+   an explicit `None` (whole-graph entry points keep their `False` default).
+   Single-component extraction, row permutation, `n_jobs` and
+   `keep_simulations=False` still reproduce the same statistics and `p_sim`.

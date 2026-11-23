@@ -2,6 +2,7 @@
 Centralised conditional randomisation engine. Numba accelerated.
 """
 
+import copy
 import hashlib
 import importlib
 import os
@@ -731,6 +732,43 @@ def rebuild_sparse_weights(w, adj):
     return rebuilt
 
 
+def transform_observed(w, transformation):
+    """Apply a weights transformation to an observed-subgraph object.
+
+    Unlike ``libpysal``'s in-place ``W.transform`` setter, this helper
+    never touches the caller's object: ``W`` instances are copied before
+    the transformation is applied, and ``Graph`` instances are immutable
+    and return a transformed copy. The result therefore standardises only
+    the retained edges.
+    """
+    if isinstance(w, W):
+        w = copy.deepcopy(w)
+        w.transform = transformation
+        return w
+    return w.transform(transformation)
+
+
+def degenerate_reference_columns(sim):
+    """Flag simulated columns whose reference distribution has no spread.
+
+    ``sim`` is ``(n_permutations, n_sites)``. A column whose finite draws are
+    all identical (a site whose focal value and self-weight exhaust its
+    component, say) has zero variance, so standardising it against that
+    reference distribution is undefined. Return a boolean mask of those
+    columns so callers can keep the interface's undefined representation
+    instead of dividing by floating-point noise and reporting a spurious
+    finite score.
+    """
+    if sim.shape[0] == 0:
+        return np.zeros(sim.shape[1], dtype=bool)
+    finite = np.isfinite(sim).all(axis=0)
+    spread = np.zeros(sim.shape[1], dtype=float)
+    if finite.any():
+        finite_cols = sim[:, finite]
+        spread[finite] = finite_cols.max(axis=0) - finite_cols.min(axis=0)
+    return finite & (spread == 0)
+
+
 def make_component_seeds(seed, z, comp_ptr, cardinalities, self_weights, other_weights):
     """
     Derive one seed per component from the master seed and a hash of the
@@ -806,8 +844,11 @@ def compute_chunk_components(
     permuted_ids : ndarray
         (permutations, max_cardinality) ids into the component's sites
         minus the focal one, shared by all sites of the component.
-    scaling : float
-        Scaling value of this component, applied to every statistic.
+    scaling : ndarray
+        (n_chunk,) per-site scaling value. It is per site, not per
+        component, because the by-component reading of Gi/Gi* may mix both
+        denominators inside one parallel task; for local Moran and
+        Gi-only components every entry of a component is the same.
     keep : bool
         If True, store the simulated statistics.
     stat_func : callable
@@ -842,16 +883,27 @@ def compute_chunk_components(
         if not active[i]:
             wloc += cardinality
             continue
-        if cardinality == 0:  # no neighbours inside the component
+        if cardinality == 0:  # no off-diagonal neighbors inside the component
+            # A site whose only retained outgoing weight is a self-loop is
+            # still part of the component through its incoming edges. Its
+            # focal value and self-weight are fixed by the conditional null,
+            # so it reaches the statistic kernel with an empty neighbour list
+            # and the self-weight in the leading slot. The zero-weight
+            # padding keeps the kernel's output length equal to the number
+            # of permutations (the historical island slot carried
+            # ``island_weight`` here; a self-weighted site is not an island,
+            # so that slot must contribute nothing).
             weights_i = np.zeros(2, dtype=other_weights.dtype)
-            weights_i[1] = island_weight
+            weights_i[0] = self_weights[i]
+            if self_weights[i] == 0:
+                weights_i[1] = island_weight
         else:
             # fix the self-weight to the first position
             weights_i = np.zeros(cardinality + 1, dtype=other_weights.dtype)
             weights_i[0] = self_weights[i]
             weights_i[1:] = other_weights[wloc : (wloc + cardinality)]
         wloc += cardinality
-        rstats = stat_func(site_offset + i, pool, permuted_ids, weights_i, scaling)
+        rstats = stat_func(site_offset + i, pool, permuted_ids, weights_i, scaling[i])
         p_sims[i] = _permutation_significance(
             observed[i], rstats, alternative=alternative
         ).item()
@@ -947,7 +999,7 @@ def _run_component_task(
             self_weights[s:e],
             other_weights[w_offsets[s] : w_offsets[e]],
             permuted_ids,
-            scaling[c],
+            scaling[s:e],
             keep,
             stat_func,
             island_weight,
@@ -1003,9 +1055,10 @@ def crand_components(
     other_weights : ndarray
         Flat buffer of off-diagonal weights in CSR data order.
     scaling : ndarray
-        (n_components,) scaling value applied to every statistic of a
-        component (e.g. (n_c - 1) / sum(z_c**2) for local Moran, the
-        component sum for local G).
+        (n_valid,) per-site scaling value applied to each statistic (e.g.
+        ``(n_c - 1) / sum(z_c**2)`` for local Moran, the site's own Gi
+        denominator for local G). Per-site rather than per-component so a
+        component that mixes Gi and Gi* sites can carry both.
     seed : None/int
         Master seed. Each component draws its own seed from it through
         ``make_component_seeds``.
@@ -1063,7 +1116,12 @@ def crand_components(
         np.cumsum(cardinalities, out=w_offsets[1:])
 
     if n_comp:
+        # a site with no off-diagonal neighbours still needs one sampled
+        # column so that the kernel returns one value per permutation; the
+        # weight at that column is zero, so the draw cannot influence the
+        # statistic.
         max_cards = np.maximum.reduceat(cardinalities, comp_ptr[:-1]).astype(np.int64)
+        max_cards = np.maximum(max_cards, 1)
     else:
         max_cards = np.empty(0, dtype=np.int64)
     seeds = make_component_seeds(

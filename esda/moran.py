@@ -21,6 +21,7 @@ from scipy import sparse
 from .crand import (
     _prepare_univariate,
     crand_components,
+    degenerate_reference_columns,
     mask_unobserved,
     rebuild_sparse_weights,
 )
@@ -1275,12 +1276,16 @@ class Moran_Local:
         standard deviations of Is under permutations.
     z_sim : arrray
         (if permutations>0)
-        standardized Is based on permutations
+        standardized Is based on permutations. NaN where the simulated
+        reference distribution has no spread (for example a site whose
+        focal value and self-weight exhaust its component), since the
+        standardisation is then undefined.
     p_z_sim : array
         (if permutations>0)
         p-values based on standard normal approximation from
         permutations (one-sided)
-        for two-sided tests, these values should be multiplied by 2
+        for two-sided tests, these values should be multiplied by 2.
+        NaN wherever ``z_sim`` is undefined.
     n_jobs : int
         Number of cores to be used in the conditional randomisation. If -1,
         all available cores are used.
@@ -1304,12 +1309,17 @@ class Moran_Local:
         computed, so a missing observation can split a network into
         separate pieces. Each component is standardised on its own
         observations, and conditional randomization only draws from the
-        remaining sites of the same component. Results are reported at
-        the original site positions; sites without a valid statistic
-        (missing observations, components with fewer than three observed
-        sites, and constant components) are returned as NaN (``q`` is 0
-        there). The input ``y`` and ``w`` are never modified, and
-        ``self.w`` then holds the transformed weights of the observed
+        remaining sites of the same component. A site that is attached to
+        its component only through incoming edges (for example a site
+        whose only outgoing weight is a self-loop) is still part of the
+        component and is analysed as such; self-loops contribute to the
+        statistic and to the analytical moments under both the
+        conditional and the total-randomisation nulls. Results are
+        reported at the original site positions; sites without a valid
+        statistic (missing observations, components with fewer than three
+        observed sites, and constant components) are returned as NaN
+        (``q`` is 0 there). The input ``y`` and ``w`` are never modified,
+        and ``self.w`` then holds the transformed weights of the observed
         subgraph. The default (False) keeps the whole-graph analysis.
     component_labels_ : array
         (only set when ``by_component=True``) (n,) component id of every
@@ -1550,33 +1560,76 @@ class Moran_Local:
             )
             q_packed[~active] = 0
 
-            # analytical moments, with each component's own n and moments
+            # analytical moments, with each component's own n and moments.
+            # The diagonal (self-loops) enters through ``self_w``: it is
+            # fixed under the conditional null but random under total
+            # randomisation, so the two nulls each get their own form.
+            # Sites without a self-loop keep the historical expressions
+            # verbatim, so results on loop-free components stay bitwise
+            # identical to earlier releases.
             with np.errstate(all="ignore"):
                 m2 = den[labels_packed] / n_c
                 wi = np.asarray(adjacency.sum(axis=1)).flatten()
                 wi2 = np.asarray(adjacency.multiply(adjacency).sum(axis=1)).flatten()
+                self_w = adjacency.diagonal().astype(np.float64)
+                off = wi - self_w
+                off2 = wi2 - self_w**2
                 n1 = n_c - 1
-                EIc = -(z_packed**2 * wi) / (n1 * m2)
-                VIc = (
+                n2 = n_c - 2
+                sumsq = den[labels_packed]
+                sum_fourth = np.bincount(
+                    labels_packed, weights=z_packed**4, minlength=n_comp
+                )[labels_packed]
+                has_loop = self_w != 0
+
+                # --- historical (loop-free) expressions -----------------
+                m4 = sum_fourth / n_c
+                kurt = m4 / m2**2
+                EIc_plain = -(z_packed**2 * wi) / (n1 * m2)
+                VIc_plain = (
                     (z_packed / m2) ** 2
-                    * (n_c / (n_c - 2))
+                    * (n_c / n2)
                     * (wi2 - (wi**2) / n1)
                     * (m2 - (z_packed**2) / n1)
                 )
-                m4 = (
-                    np.bincount(labels_packed, weights=z_packed**4, minlength=n_comp)
-                    / sizes
+                EI_plain = -wi / n1
+                VI_plain = wi2 * (n_c - kurt) / n1
+                VI_plain += (wi**2 - wi2) * (2 * kurt - n_c) / (n1 * n2)
+                VI_plain -= (-wi / n1) ** 2
+
+                # --- self-loop aware expressions ------------------------
+                # conditional null: z_i and its self-weight are fixed;
+                # the remaining positions are sampled without replacement.
+                EIc_loop = (z_packed**2 * (self_w - off / n1)) / m2
+                VIc_loop = (
+                    (z_packed / m2) ** 2
+                    * (1 / n2)
+                    * (off2 - off**2 / n1)
+                    * (sumsq - z_packed**2 * (1 + 1 / n1))
                 )
-                b2 = (m4 / (den / sizes) ** 2)[labels_packed]
-                EI = -wi / n1
-                VI = wi2 * (n_c - b2) / n1
-                VI += (wi**2 - wi2) * (2 * b2 - n_c) / (n1 * (n_c - 2))
-                VI -= (-wi / n1) ** 2
+                # total randomization null: every position, the focal one
+                # included, is permuted, so the self term is random too.
+                EI_loop = self_w - off / n1
+                second_moment = (
+                    self_w**2 * m4
+                    - 2 * self_w * off * m4 / n1
+                    + off2 * (sumsq**2 - sum_fourth) / (n_c * n1)
+                    + (off**2 - off2)
+                    * (2 * sum_fourth - sumsq**2)
+                    / (n_c * n1 * n2)
+                )
+                VI_loop = second_moment / m2**2 - EI_loop**2
+
+                EIc = np.where(has_loop, EIc_loop, EIc_plain)
+                VIc = np.where(has_loop, VIc_loop, VIc_plain)
+                EI = np.where(has_loop, EI_loop, EI_plain)
+                VI = np.where(has_loop, VI_loop, VI_plain)
             # degenerate components report missing moments as well
-            EI[~active_comp[labels_packed]] = np.nan
-            VI[~active_comp[labels_packed]] = np.nan
-            EIc[~active_comp[labels_packed]] = np.nan
-            VIc[~active_comp[labels_packed]] = np.nan
+            degenerate = ~active_comp[labels_packed]
+            EI[degenerate] = np.nan
+            VI[degenerate] = np.nan
+            EIc[degenerate] = np.nan
+            VIc[degenerate] = np.nan
 
             self.z[valid_pos_packed] = z_packed
             self.Is[valid_pos_packed] = Is_packed
@@ -1604,7 +1657,9 @@ class Moran_Local:
                 adj_off.sort_indices()
                 other_weights = adj_off.data.astype(np.float64)
                 cardinalities = np.asarray((adj_off != 0).sum(axis=1)).flatten()
-                scaling = (sizes - 1) / den
+                # per-site scaling so a component's sites share their own
+                # (n_c - 1) / sum(z_c**2) factor
+                scaling = (n_c - 1) / den[labels_packed]
                 p_sims, rlocals = crand_components(
                     z_packed,
                     Is_packed,
@@ -1643,8 +1698,15 @@ class Moran_Local:
                 self.EI_sim = self.sim.mean(axis=0)
                 self.seI_sim = self.sim.std(axis=0)
                 self.VI_sim = self.seI_sim * self.seI_sim
+                # A degenerate reference distribution (all draws identical,
+                # e.g. a site whose focal value and self-weight exhaust its
+                # component) leaves the standardisation undefined; keep the
+                # interface's undefined representation instead of turning
+                # floating-point noise into a spurious finite score.
+                degenerate_col = degenerate_reference_columns(self.sim)
                 with np.errstate(divide="ignore", invalid="ignore"):
                     self.z_sim = (self.Is - self.EI_sim) / self.seI_sim
+                self.z_sim[degenerate_col] = np.nan
                 self.p_z_sim = stats.norm.sf(np.abs(self.z_sim))
             else:
                 self.p_sim = np.full(n, np.nan)
